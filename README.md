@@ -1,190 +1,135 @@
 # citrixInspector
 
-`citrixInspector.py` (formerly `cve_2023_3519_inspector.py`) is a Python-based, passive vulnerability
-scanner for Citrix ADC / Citrix Gateway / NetScaler ADC / NetScaler Gateway appliances. It fingerprints
-the exact firmware build of a target without authentication, and reports every known CVE that build is
-vulnerable to.
+`citrixInspector.py` is a Python command-line tool for identifying Citrix ADC / Citrix Gateway (formerly NetScaler) appliances, fingerprinting firmware builds where possible, and checking those builds against a maintained set of known CVE version thresholds.
 
-> **⚠️ Beta:** Detection for the newer 2025/2026 CVEs (CitrixBleed 2/3, CVE-2026-8452,
-> CVE-2026-88771/88772) is in **beta**. It relies on being able to fingerprint the exact firmware
-> build via the GZIP-timestamp or vhash techniques; when neither works on a target, the scanner
-> falls back to a much coarser, CVE-2023-3519-only heuristic and will not flag the newer CVEs at
-> all (see the Checks Performed section below). Treat results for the newer CVEs as informational
-> only.
+The scanner makes unauthenticated HTTP requests and does not attempt to exploit vulnerabilities or change appliance state. Use it only on systems you own or are explicitly authorized to assess.
 
-![Sample scan output showing a build identified as 13.0-91.13, patched for CVE-2023-3519 but vulnerable to 9 newer CVEs](docs/sample-scan.png)
+![Example scan output](docs/sample-scan.png)
 
-*Output was run against a simulated test harness. Hostname is a placeholder only.*
+*The sample output was produced in a simulated test harness; the hostname is a placeholder.*
 
+## What it checks
 
-### Recent Updates (2026)
-- Renamed `cve_2023_3519_inspector.py` to `citrixInspector.py` to reflect its broader, multi-CVE scope.
-- Added GZIP-timestamp version fingerprinting (`/vpn/js/rdx/core/lang/rdx_en.json.gz`) as the primary,
-  most reliable unauthenticated build-identification technique, since the legacy `v=<hash>` static
-  resource hash is "not always present anymore" on modern builds.
-- Refreshed and greatly expanded the version-hash and GZIP-timestamp lookup tables, now covering builds
-  from August 2018 through November 2025 (previously stopped at ~October 2023, with no 14.x coverage).
-- Once an exact build is identified, the scanner now checks it against 10 CVEs instead of just
-  CVE-2023-3519: CVE-2025-5349/5777 ("CitrixBleed 2"), CVE-2025-6543, CVE-2025-7775/7776/8424
-  ("CitrixBleed 3"), CVE-2026-8452, and CVE-2026-88771/88772 (actively exploited, CISA KEV). See
-  "CVE Coverage" below.
-- Replaced the CVE-2023-3519 patch heuristic (guessing from the page's `Last-Modified` header) with a
-  precise version-threshold comparison whenever an exact build is known, falling back to the original
-  heuristic only when no build can be identified.
-- Added functionality to parse the /vpn/pluginlist.xml file to determine more accurate checks if patched or vulnerable
-- Added funcionality to optionally check for common web shell IOCs on the target server.
-- Implemented logic on scanner to determine if target is verified patched. Thanks @UK_Daniel_Card & @DTCERT
+- **Firmware fingerprinting:** Uses the GZIP `MTIME` timestamp in `/vpn/js/rdx/core/lang/rdx_en.json.gz` as the primary build-identification method, then checks legacy `v=<md5>` hashes in page resources. The GZIP technique is generally more useful on modern builds; either fingerprint can be unavailable or absent from the lookup data.
+- **Known CVEs:** Compares an identified build with the version thresholds listed below and reports all matching CVEs.
+- **Additional signals:** Checks `/vpn/pluginlist.xml` for the Windows EPA plug-in version and examines the page title, known Citrix icons, HTML comments, and `Last-Modified` header. These signals can help identify an appliance or inform a lower-confidence result when an exact build is unavailable.
+- **Optional IOC checks:** Checks known paths under `/vpn/themes/` for web-shell indicators associated with exploitation. A matching HTTP response is a lead for investigation, not proof of compromise.
+- **Resilient scanning:** Retries transient HTTP failures and isolates individual targets so that an unreachable target does not stop a batch scan.
+
+## Improvements
+
+The scanner is designed to keep useful results flowing when targets or responses are unreliable:
+
+- All requests use a shared HTTP session with up to five retries for connection/read failures and transient HTTP responses (`429`, `500`, `502`, `503`, and `504`), with exponential backoff.
+- Each request has separate connection and read timeouts (10 and 20 seconds). If a request still fails, the scanner logs the error and skips that check instead of terminating the run.
+- Checks that depend on optional or malformed responses, including the GZIP fingerprint, `pluginlist.xml`, page HTML, and `Last-Modified` header, degrade gracefully when the expected data is unavailable or invalid.
+- During IOC checks, an unreachable IOC path is logged and skipped so the remaining paths can still be checked. In batch mode, failures are isolated per target so later URLs continue to be scanned.
+- Target lists may include blank lines and `#` comments, and a short pause is added between targets.
+- **Python compatibility:** Updated the pinned `cffi` dependency to `2.1.1` to support newer Python versions.
+
+## CVE coverage
+
+The checks below are based on the version thresholds encoded in the scanner. Fixed builds are shown for the main release tracks; FIPS/NDcPP tracks may have separate thresholds, noted where relevant.
+
+| CVE(s) | Description | Fixed in |
+|---|---|---|
+| CVE-2023-3519 | Unauthenticated remote code execution (stack overflow) | 13.0-91.13; 13.1-49.13 |
+| CVE-2025-5349, CVE-2025-5777 | “CitrixBleed 2” memory disclosure | 14.1-43.56; 13.1-58.32; FIPS 13.1-37.235; FIPS 12.1-55.328 |
+| CVE-2025-6543 | Gateway memory overflow; exploited in the wild | 14.1-47.46; 13.1-59.19; FIPS 13.1-37.236 |
+| CVE-2025-7775, CVE-2025-7776, CVE-2025-8424 | “CitrixBleed 3” memory disclosure / access control issues | 14.1-47.48; 13.1-59.22; FIPS 13.1-37.241; FIPS 12.1-55.330 |
+| CVE-2026-8452 | Pre-auth SAML PrefixList heap overflow | 14.1-72.61; 13.1-63.18 |
+| CVE-2026-88771, CVE-2026-88772 | Pre-auth command injection / DTLS memory overflow; listed in CISA KEV | 14.1-73.37; 13.1-64.23; FIPS 14.1-73.37; FIPS-NDcPP 13.1-37.279 |
+
+Some CVEs depend on appliance configuration. In particular, CVE-2026-8452 requires a SAML SP or IdP policy bound to the virtual server. This scanner does not inspect authenticated configuration, so a version match alone does not establish that a configuration-dependent issue is exploitable. End-of-life releases may be reported vulnerable where the scanner has no fixed build threshold for that branch.
+
+Only the CVEs represented in the scanner's version-check table are covered; this is not a complete assessment of every Citrix advisory or appliance configuration.
+
+## Requirements
+
+- Python 3
+- Packages listed in [`requirements.txt`](requirements.txt)
 
 ## Installation
 
-This script requires Python 3.6+ and the following Python packages:
-
-- requests
-- BeautifulSoup4
-- argparse
-- re
-- logging
-- warnings
-
-To install the required packages, run:
-
 ```bash
-git clone https://github.com/securekomodo/citrixInspector.git
+git clone https://github.com/dylvie/citrixInspector.git
 cd citrixInspector
-pip install -r requirements.txt
-python citrixInspector.py -u <target_url>
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
+
+On Windows, activate the environment with `.venv\Scripts\activate` instead.
 
 ## Usage
-```
-    Author: Bryan Smith (@securekomodo)
-    ------------------------
-    _________ .__  __         .__                              
-    \_   ___ \|__|/  |________|__|__  ___                      
-    /    \  \/|  \   __\_  __ \  \  \/  /                      
-    \     \___|  ||  |  |  | \/  |>    <                       
-     \______  /__||__|  |__|  |__/__/\_ \                      
-        \/                         \/                      
-    .___                                     __                
-    |   | ____   ____________   ____   _____/  |_  ___________ 
-    |   |/    \ /  ___/\____ \_/ __ \_/ ___\   __\/  _ \_  __ \
-    |   |   |  \___ \ |  |_> >  ___/\  \___|  | (  <_> )  | \/
-    |___|___|  /____  >|   __/ \___  >\___  >__|  \____/|__|   
-             \/     \/ |__|        \/     \/                                
 
-       citrixInspector
-       ------------------------
-       
-usage: citrixInspector.py [-h] (-u URL | -f FILE) [--ioc-check] [-l LOG]
-
-Fingerprint and check Citrix ADC / NetScaler ADC & Gateway for known CVEs.
-
-optional arguments:
-  -h, --help            show this help message and exit
-  -u URL, --url URL     The URL of the Citrix/NetScaler Gateway to check.
-  -f FILE, --file FILE  A file containing a list of URLs to check.
-  --ioc-check           Slower. Performs IOC (Indicator of Compromise) check.
-  -l LOG, --log LOG     Log file to write the output.
-
-```
-
-The `citrixInspector.py` script can either accept a single URL or a file with a list of URLs as input. It then performs a series of checks to determine the potential vulnerability of the given Citrix/NetScaler Gateways:
+Check one authorized target:
 
 ```bash
-# Check a single URL
-python citrixInspector.py --url https://example.com
-
-# Check multiple URLs from a file
-python citrixInspector.py --file urls.txt
-
-# Check multiple URLs from a file and check for IOCs
-python citrixInspector.py --file urls.txt --ioc-check
+python citrixInspector.py --url https://gateway.example.com
 ```
 
-To specify a log file for output, use the `--log` option:
+Check a list of targets (one URL per line). Blank lines and lines beginning with `#` are ignored:
+
+```text
+# gateways included in the authorized assessment
+https://gateway-one.example.com
+https://gateway-two.example.com
+```
 
 ```bash
-python citrixInspector.py --url https://example.com --log my_log.log
+python citrixInspector.py --file targets.txt
 ```
 
-For help:
+Run the slower optional web-shell IOC checks as well:
+
+```bash
+python citrixInspector.py --url https://gateway.example.com --ioc-check
+python citrixInspector.py --file targets.txt --ioc-check
+```
+
+Write scan details to a specific log file:
+
+```bash
+python citrixInspector.py --file targets.txt --log assessment.log
+```
+
+Show all command-line options:
 
 ```bash
 python citrixInspector.py --help
 ```
 
-## Checks Performed
+`--url` and `--file` are mutually exclusive and one is required. The default log file is `citrixInspector.log`; each run replaces that file unless another path is supplied.
 
-The `citrixInspector.py` script performs the following checks on the target websites:
+## Understanding results
 
-- **GZIP-timestamp version fingerprinting** (primary): reads the GZIP `MTIME` header field (RFC 1952)
-  of `/vpn/js/rdx/core/lang/rdx_en.json.gz`, which is set at firmware compile time and uniquely
-  identifies the exact build. This is the current recommended technique from the Fox-IT Security
-  Research Team, since the vhash technique below "is not always present anymore" on modern builds.
-- **vhash version fingerprinting** (secondary/legacy): checks for the presence of specific `v=<md5>`
-  hashes in static resource URLs embedded in the HTML content. This is based off the amazing work
-  from Fox-IT (NCC Group) back in 2022:
-  https://blog.fox-it.com/2022/12/28/cve-2022-27510-cve-2022-27518-measuring-citrix-adc-gateway-version-adoption-on-the-internet/
-- Checks for the recent version of the pluginlist.xml file located at /vpn/pluginlist.xml
-- (Optional) Check for the presence of common web shells known to be affiliated with exploitation in the wild
-- Check if the HTTP title is "Citrix Gateway" / "NetScaler Gateway" / "NetScaler AAA" / "Digital Workplace"
-- Check for the presence of an HTML comment containing the text "frame-busting" which was found as an artifact on older/legacy citrix installations
-- Check for the presence of specific icons associated with Citrix Gateway
+| Output | Meaning |
+|---|---|
+| `[VULNERABLE] [CERTAIN] [CVE…] [version]` | A build was identified and falls below one or more listed fix thresholds. “Certain” describes the version-based result, not proof of exploitation or configuration applicability. |
+| `[PATCHED] [CERTAIN] [version]` | A build was identified and is at or above the covered CVE thresholds. This does not mean the appliance is free of other vulnerabilities. |
+| `[VULNERABLE] [FIRM]` | No exact build was identified; multiple legacy signals indicate possible CVE-2023-3519 exposure. |
+| `[VULNERABLE] [TENTATIVE]` | Citrix indicators and the plug-in check suggest possible exposure, but an exact firmware build was not identified. |
+| `[CITRIX DETECTED]` | Citrix indicators were found, but the available signals did not establish a vulnerability result. |
+| `[CITRIX NOT DETECTED]` | The scanner did not find enough indicators to identify a Citrix appliance. This is not proof that the service is absent. |
+| `[UNREACHABLE]` or `[ERROR]` | The target could not be checked successfully; review the console output and log. |
+| `[COMPROMISE DETECTED]` | A known IOC path returned HTTP 200. Investigate the response and host; this result alone is not confirmation of compromise. |
 
-Whenever an exact build can be identified (via the GZIP-timestamp check, the vhash check, or
-`pluginlist.xml`), the script checks that build against every CVE in the table below and reports all
-that apply (`[CERTAIN]`). When no exact build can be identified, it falls back to the original
-title/icon/comment/header heuristics (`[FIRM]` / `[TENTATIVE]` / `[CITRIX DETECTED]`), scoped only to
-CVE-2023-3519 as before.
+An exact fingerprint is only as current and complete as the scanner's lookup tables. If no version is identified, the fallback heuristics are much less comprehensive and cover only limited CVE-2023-3519 signals; they do not assess the newer CVEs.
 
-## CVE Coverage
+## Data sources and acknowledgements
 
-| CVE | Description | Fixed in |
-|---|---|---|
-| CVE-2023-3519 | Unauthenticated RCE (stack overflow) | `13.0-91.13` / `13.1-49.13` |
-| CVE-2025-5349 / CVE-2025-5777 | "CitrixBleed 2" - memory disclosure | `14.1-43.56` / `13.1-58.32` |
-| CVE-2025-6543 | Memory overflow (Gateway), exploited in the wild | `14.1-47.46` / `13.1-59.19` |
-| CVE-2025-7775 / CVE-2025-7776 / CVE-2025-8424 | "CitrixBleed 3" | `14.1-47.48` / `13.1-59.22` |
-| CVE-2026-8452 | Pre-auth SAML PrefixList heap overflow (requires SAML SP/IdP config) | `14.1-72.61` / `13.1-63.18` |
-| CVE-2026-88771 / CVE-2026-88772 | Pre-auth command injection / DTLS memory overflow — actively exploited, in CISA KEV | `14.1-73.37` / `13.1-64.23` |
+- Fox-IT Security Research Team: GZIP-timestamp and vhash fingerprinting techniques and version data, adapted with attribution from [citrix-netscaler-triage](https://github.com/fox-it/citrix-netscaler-triage) (Apache-2.0) and its [2022 research post](https://blog.fox-it.com/2022/12/28/cve-2022-27510-cve-2022-27518-measuring-citrix-adc-gateway-version-adoption-on-the-internet/).
+- Citrix security bulletins: CTX561482, CTX693420, CTX694788, CTX694938, CTX696604, and CTX697096.
+- watchTowr Labs: [CVE-2026-8452 analysis](https://labs.watchtowr.com/youre-back-in-the-room-citrix-netscaler-pre-auth-rce-cve-2026-8452/) and [CVE-2026-88771 analysis](https://labs.watchtowr.com/oh-look-the-foot-gun-went-off-again-citrix-netscaler-preauth-command-injection-cve-2026-88771/).
+- BishopFox: [CVE-2026-8452 check](https://github.com/BishopFox/CVE-2026-8452-check).
+- Deutsche Telekom CERT: [original CVE-2023-3519 scanner and header heuristic](https://github.com/telekom-security/cve-2023-3519-citrix-scanner).
 
-All branches that reached End-Of-Life before a fix was released (11.1, 12.1 non-FIPS/NDcPP, 13.0) are
-reported as vulnerable to every CVE above. FIPS/NDcPP builds (12.1-55.x, 13.1-37.x) are checked against
-their own, separately-published fix builds.
+## Legal notice
 
-Only CVEs with a reliable, publicly documented version threshold are included. Several other CVEs in
-the CTX697096 and CTX696604 bulletins (e.g. CVE-2026-88773–88778) require authenticated configuration
-inspection to determine applicability and are intentionally out of scope for this passive scanner.
-
-## Credits & Data Sources
-
-- **Fox-IT Security Research Team** — the GZIP-timestamp and vhash fingerprinting techniques, and the
-  version lookup tables, are ported/adapted (with attribution in the source) from their actively
-  maintained, Apache-2.0-licensed
-  [citrix-netscaler-triage](https://github.com/fox-it/citrix-netscaler-triage) project, and the
-  [original 2022 blog post](https://blog.fox-it.com/2022/12/28/cve-2022-27510-cve-2022-27518-measuring-citrix-adc-gateway-version-adoption-on-the-internet/).
-- **watchTowr Labs** — CVE-2026-8452 and CVE-2026-88771 technical analysis and fixed-version details:
-  https://labs.watchtowr.com/youre-back-in-the-room-citrix-netscaler-pre-auth-rce-cve-2026-8452/ and
-  https://labs.watchtowr.com/oh-look-the-foot-gun-went-off-again-citrix-netscaler-preauth-command-injection-cve-2026-88771/
-- **BishopFox** — corroborating fixed-version data for CVE-2026-8452:
-  https://github.com/BishopFox/CVE-2026-8452-check
-- **Deutsche Telekom CERT** — original CVE-2023-3519 `Last-Modified` header patch heuristic:
-  https://github.com/telekom-security/cve-2023-3519-citrix-scanner
-
-## Contributing
-
-Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
-
-## Legal Disclaimer
-This project is made for educational and ethical testing purposes only. Usage of citrixInspector for attacking targets without prior mutual consent is illegal. It is the end user's responsibility to obey all applicable local, state and federal laws. Developers assume no liability and are not responsible for any misuse or damage caused by this program.
-
-## License
-The project is licensed under MIT License.
+This project is intended for authorized security testing and research. Obtain permission before scanning any system. You are responsible for complying with applicable laws and rules of engagement. The software is provided “as is,” without warranty; see [LICENSE](LICENSE).
 
 ## Author
-Bryan Smith
 
-- Twitter: https://twitter.com/securekomodo
-- Bugcrowd/Hackerone: @securekomodo / @d4rkm0de
-
----
+Bryan Smith (@securekomodo)
+Improved by Dylvie Shwartz (@dylvie)

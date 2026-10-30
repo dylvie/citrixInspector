@@ -17,31 +17,53 @@
 #     not always present on modern builds)
 # See the "Checks Performed" and "Credits & Data Sources" sections of README.md for
 # full details & sources.
+#
+# NETWORK RESILIENCE NOTES
+#   - All HTTP traffic goes through a shared requests.Session with urllib3.Retry
+#     (exponential backoff) mounted on both http:// and https:// adapters.
+#   - A single http_get() wrapper catches every network-level exception and returns
+#     None on failure instead of raising, so individual checks degrade gracefully.
+#   - Each URL (and each IOC path) is checked in isolation: one unreachable or
+#     misbehaving target can never abort the whole scan.
 
 
 import argparse
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 import re
 import logging
 import warnings
 import sys
 import subprocess
-import pkg_resources
 import datetime
+import time
+from importlib.metadata import PackageNotFoundError, version
 from typing import NamedTuple, Optional
 from xml.etree import ElementTree as ET
 from urllib.parse import urlparse
 
-# How many checks per URL
+# How many attempts per URL-level check (used as the HTTP retry ceiling)
 MAX_RETRIES = 5
+
+# Per-request timeouts: (connect timeout, read timeout) in seconds.
+# A short connect timeout makes unreachable hosts fail fast; the read timeout
+# covers slow/suspended responses. Both are honored independently of the
+# transport-level retries below.
+CONNECT_TIMEOUT = 10
+READ_TIMEOUT = 20
+REQUEST_TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
+
+# Delay multiplier for exponential backoff between retry attempts (seconds).
+BACKOFF_FACTOR = 1.5
 
 # Check if the OpenSSL version is the one required
 REQUIRED_VERSION = "1.26.6"
 try:
     # Get the current version of urllib3
-    current_version = pkg_resources.get_distribution("urllib3").version
-except pkg_resources.DistributionNotFound:
+    current_version = version("urllib3")
+except PackageNotFoundError:
     current_version = None
 
 # Check if the urllib3 version is not the one required
@@ -51,12 +73,78 @@ if current_version != REQUIRED_VERSION:
 
 # Ignore all the SSL/TLS certificate warnings
 warnings.filterwarnings('ignore')
+# Also silence urllib3's own insecure-request warnings (urllib3 >= 1.26 / 2.x)
+try:
+    from urllib3.exceptions import InsecureRequestWarning
+    warnings.simplefilter('ignore', InsecureRequestWarning)
+except ImportError:
+    pass
 
 
-# Legacy CVE-2023-3519 patch heuristic based on the main page's HTTP Last-Modified header.
-# Kept as a last-resort signal for targets where no exact build can be identified via the
-# vhash / GZIP-timestamp techniques below.
-# THANKS https://github.com/telekom-security/cve-2023-3519-citrix-scanner/blob/main/CVE-2023-3519-checker.py
+# ──────────────────────────────────────────────────────────────────────────────
+#  RESILIENT HTTP LAYER
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _build_session() -> requests.Session:
+    """Create a requests.Session with automatic retries and backoff.
+
+    Retry is configured at the transport (urllib3) level for connection errors,
+    read timeouts, and transient HTTP statuses (429/5xx), with exponential
+    backoff. Redirects are NOT followed at the adapter level; callers that need
+    redirect behavior pass allow_redirects explicitly to http_get().
+    """
+    session = requests.Session()
+    retry = Retry(
+        total=MAX_RETRIES,
+        connect=MAX_RETRIES,
+        read=MAX_RETRIES,
+        status=MAX_RETRIES,
+        backoff_factor=BACKOFF_FACTOR,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "HEAD"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_maxsize=10)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+    return session
+
+
+SESSION = _build_session()
+
+
+def http_get(url: str, allow_redirects: bool = False) -> Optional[requests.Response]:
+    """Perform a GET request with full network-failure tolerance.
+
+    Returns the response object on success (any HTTP status), or None if the
+    request could not be completed after all retries (DNS failure, connection
+    refused/reset, TLS errors, timeouts, etc.).
+
+    Never raises: callers can simply test for None.
+    """
+    try:
+        return SESSION.get(
+            url,
+            verify=False,
+            allow_redirects=allow_redirects,
+            timeout=REQUEST_TIMEOUT,
+        )
+    except (requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.TooManyRedirects,
+            requests.exceptions.RequestException) as e:
+        logging.error(f"Request to {url} failed after retries. Error: {e}")
+        return None
+    except Exception as e:  # last-resort guard (e.g. malformed URL, socket errors)
+        logging.error(f"Unexpected error requesting {url}: {e}")
+        return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  LEGACY CVE-2023-3519 PATCH HEURISTIC DATA
+# ──────────────────────────────────────────────────────────────────────────────
+
 PATCHED_VERSIONS = [
     {"version": "13.0-91.13", "timestamp": "Fri, 07 Jul 2023 15:39:40 GMT"},
     {"version": "13.1-49.13", "timestamp": "Mon, 10 Jul 2023 17:41:17 GMT"},
@@ -663,41 +751,53 @@ def get_vulnerable_cves(version: str):
     return sorted(cve for cve, (check, _desc) in CVE_CHECKS.items() if check(vtuple))
 
 
-
-def check_pluginlist_xml(url):
+def check_pluginlist_xml(url) -> Optional[str]:
     parsed_url = urlparse(url)
     site = f"{parsed_url.scheme}://{parsed_url.netloc}"
-    logging.info(f"Making request to {site} to determine XML version")
-    response = requests.get(f"{site}/vpn/pluginlist.xml", verify=False, allow_redirects=False, timeout=MAX_RETRIES)
+    target = f"{site}/vpn/pluginlist.xml"
+    logging.info(f"Making request to {target} to determine XML version")
+
+    response = http_get(target)
+    if response is None:
+        logging.error(f"{site} - Could not reach {target} (network failure)")
+        return None
 
     # check if request was successful
     if response.status_code == 200:
-        root = ET.fromstring(response.content)
+        try:
+            root = ET.fromstring(response.content)
+        except ET.ParseError as e:
+            logging.error(f"{site} - pluginlist.xml is not valid XML: {e}")
+            return None
 
         # find the plugin
-        for repository in root.findall('repository'):
-            for plugin in repository.findall('plugin'):
-                name = plugin.get('name')
-                version = plugin.get('version')
+        try:
+            for repository in root.findall('repository'):
+                for plugin in repository.findall('plugin'):
+                    name = plugin.get('name')
+                    version = plugin.get('version')
 
-                # check if this is the plugin we are interested in
-                if name == "Netscaler Gateway EPA plug-in for Windows (32 bit)":
-                    # extract the major version
-                    major_version = int(version.split(".")[0])
-                    minor_version = int(version.split(".")[1])
+                    # check if this is the plugin we are interested in
+                    if name == "Netscaler Gateway EPA plug-in for Windows (32 bit)":
+                        # extract the major version
+                        major_version = int(version.split(".")[0])
+                        minor_version = int(version.split(".")[1])
 
-                    if major_version < 22:
-                        logging.info(f"{site} - Matched Version: {version}")
-                        return "VULNERABLE"
-                    if major_version >= 23:
-                        if minor_version >= 5:
+                        if major_version < 22:
                             logging.info(f"{site} - Matched Version: {version}")
-                            return "PATCHED"
-                    else:
-                        logging.info(f"{site} - Version does not match: {version}")
+                            return "VULNERABLE"
+                        if major_version >= 23:
+                            if minor_version >= 5:
+                                logging.info(f"{site} - Matched Version: {version}")
+                                return "PATCHED"
+                        else:
+                            logging.info(f"{site} - Version does not match: {version}")
+        except (AttributeError, TypeError, ValueError, IndexError) as e:
+            logging.error(f"{site} - Malformed pluginlist.xml content: {e}")
+            return None
     else:
-        logging.info(f"{site} - Failed to fetch XML")
-
+        logging.info(f"{site} - Failed to fetch XML (HTTP {response.status_code})")
+    return None
 
 
 def is_site_compromised(url):
@@ -705,19 +805,21 @@ def is_site_compromised(url):
     site = f"{parsed_url.scheme}://{parsed_url.netloc}"
 
     for ioc in POTENTIALLY_COMPROMISED_FILES:
-        try:
-            webshell_path = site + "/vpn/themes/" + ioc
-            logging.info(f"Making request to {webshell_path} to determine if compromised")
-            response = requests.get(webshell_path, verify=False, allow_redirects=False, timeout=MAX_RETRIES)
-        except requests.exceptions.RequestException as e:
-            logging.error(f"An error occurred while trying to connect to {webshell_path}. Error: {e}")
-            return
+        webshell_path = site + "/vpn/themes/" + ioc
+        logging.info(f"Making request to {webshell_path} to determine if compromised")
+        response = http_get(webshell_path)
+
+        # Network failure: log it and continue with the next IOC instead of
+        # aborting the entire compromise check (previous behavior returned).
+        if response is None:
+            logging.error(f"{webshell_path} - Unreachable after retries; skipping this IOC")
+            continue
 
         if response.status_code == 200:
             print(f"{webshell_path} - [COMPROMISE DETECTED]")
             logging.info(f"{webshell_path} is potentially compromised! Evidence of web shell observed!")
         elif response.status_code != 404:
-            logging.info(f"{webshell_path} - Benign Result: {response.text}")
+            logging.info(f"{webshell_path} - Benign Result: HTTP {response.status_code}")
 
 
 def check_rdx_gzip_timestamp(url) -> Optional[str]:
@@ -729,19 +831,18 @@ def check_rdx_gzip_timestamp(url) -> Optional[str]:
     modification timestamp as a little-endian uint32 in bytes 4-7. That timestamp is
     set at firmware compile time, so it uniquely identifies the build.
 
-    Returns the matched version string, or None if the resource is missing, not a
-    valid GZIP file, has its timestamp stripped (MTIME=0), or the timestamp is not in
-    our lookup table.
+    Returns the matched version string, or None if the resource is unreachable,
+    missing, not a valid GZIP file, has its timestamp stripped (MTIME=0), or the
+    timestamp is not in our lookup table.
     """
     parsed_url = urlparse(url)
     site = f"{parsed_url.scheme}://{parsed_url.netloc}"
     gzip_path = f"{site}/vpn/js/rdx/core/lang/rdx_en.json.gz"
 
-    try:
-        logging.info(f"Making request to {gzip_path} to extract the GZIP build timestamp")
-        response = requests.get(gzip_path, verify=False, allow_redirects=False, timeout=MAX_RETRIES)
-    except requests.exceptions.RequestException as e:
-        logging.error(f"An error occurred while trying to connect to {gzip_path}. Error: {e}")
+    logging.info(f"Making request to {gzip_path} to extract the GZIP build timestamp")
+    response = http_get(gzip_path)
+    if response is None:
+        logging.error(f"{gzip_path} - Unreachable after retries; GZIP fingerprint skipped")
         return None
 
     if response.status_code != 200:
@@ -771,15 +872,26 @@ def check_rdx_gzip_timestamp(url) -> Optional[str]:
 def is_site_vulnerable(url):
     try:
         logging.info(f"Making request to {url}")
-        response = requests.get(url, verify=False, timeout=MAX_RETRIES)
-    except requests.exceptions.RequestException as e:
-        logging.error(f"An error occurred while trying to connect to {url}. Error: {e}")
+        response = http_get(url, allow_redirects=True)
+    except Exception as e:  # defensive: http_get should never raise, but be safe
+        logging.error(f"An unexpected error occurred while connecting to {url}. Error: {e}")
         print(f"{url} - [UNREACHABLE]")
         return
 
-    html_content = response.text
+    if response is None:
+        logging.error(f"{url} - Unreachable after all retries")
+        print(f"{url} - [UNREACHABLE]")
+        return
 
-    soup = BeautifulSoup(html_content, 'html.parser')
+    # Defensive decode: some devices return bytes that aren't valid in the
+    # declared charset; never let text decoding kill the analysis.
+    html_content = response.text or ""
+
+    try:
+        soup = BeautifulSoup(html_content, 'html.parser')
+    except Exception as e:
+        logging.error(f"{url} - Failed to parse HTML: {e}")
+        soup = BeautifulSoup("", 'html.parser')
 
     # Initialize checks
     title_check = False
@@ -792,7 +904,7 @@ def is_site_vulnerable(url):
     xml_check = False
 
     # Check if the title is "Citrix" related
-    if soup.title.string in ["Citrix Gateway", "NetScaler AAA", "Digital Workplace", "NetScaler Gateway"]:
+    if soup.title and soup.title.string in ["Citrix Gateway", "NetScaler AAA", "Digital Workplace", "NetScaler Gateway"]:
         title_check = True
         logging.info(f"{url} - Title Check Passed")
 
@@ -855,19 +967,25 @@ def is_site_vulnerable(url):
             logging.info(f"{url} - No Last-Modified header present; skipping legacy header heuristic")
 
         if last_modified:
-            for patch in PATCHED_VERSIONS:
-                if last_modified == datetime.datetime.strptime(patch["timestamp"], "%a, %d %b %Y %H:%M:%S %Z"):
-                    logging.info(f"{url} - Patch Check Passed. Not Vulnerable")
-                    patched = True
-                    identified_version = patch["version"]
-                elif not patched and last_modified < datetime.datetime.strptime("01 Jul 2023 00:00:00 GMT", "%d %b %Y %H:%M:%S %Z"):
-                    header_check = True
-                    logging.info(f"{url} - Header Check Complete. potentially vulnerable (older than 01 Jul 2023)")
-                elif not patched and "Jul 2023" in last_modified_header:
-                    header_check = True
-                    logging.info(f"{url} - Header Check Complete. Most Likely Patched (newer than 01 Jul 2023)")
-                    identified_version = None
-                    patched = True
+            try:
+                cutoff = datetime.datetime.strptime("01 Jul 2023 00:00:00 GMT", "%d %b %Y %H:%M:%S %Z")
+                for patch in PATCHED_VERSIONS:
+                    patch_dt = datetime.datetime.strptime(patch["timestamp"], "%a, %d %b %Y %H:%M:%S %Z")
+                    if last_modified == patch_dt:
+                        logging.info(f"{url} - Patch Check Passed. Not Vulnerable")
+                        patched = True
+                        identified_version = patch["version"]
+                    elif not patched and last_modified < cutoff:
+                        header_check = True
+                        logging.info(f"{url} - Header Check Complete. potentially vulnerable (older than 01 Jul 2023)")
+                    elif not patched and "Jul 2023" in last_modified_header:
+                        header_check = True
+                        logging.info(f"{url} - Header Check Complete. Most Likely Patched (newer than 01 Jul 2023)")
+                        identified_version = None
+                        patched = True
+            except ValueError as e:
+                logging.error(f"{url} - Failed to parse patch-timestamp data: {e}")
+
         if identified_version:
             vulnerable_cves = get_vulnerable_cves(identified_version)
             patched = not vulnerable_cves
@@ -907,33 +1025,48 @@ def is_site_vulnerable(url):
         logging.info(f"{url} - {message}")
     print(f"{url} - {status} {message}")
 
+
 def process_urls(urls, iocs):
-    print(f"Checking list if vulnerable to known Citrix ADC / NetScaler Gateway CVEs")
+    print("Checking list if vulnerable to known Citrix ADC / NetScaler Gateway CVEs", flush=True)
     if iocs:
-        print(f"Checking list if compromised by CVE-2023-3519 (Be patient!)")
+        print("Checking list if compromised by CVE-2023-3519 (Be patient!)", flush=True)
     for url in urls:
-        if iocs:
-            is_site_compromised(url.strip())
-        is_site_vulnerable(url.strip())
+        url = url.strip()
+        if not url or url.startswith("#"):
+            continue
+        print(f"{url} - Checking for known Citrix ADC / NetScaler Gateway CVEs", flush=True)
+        try:
+            if iocs:
+                is_site_compromised(url)
+            is_site_vulnerable(url)
+        except Exception as e:
+            # Error isolation: one bad URL (malformed, DNS dead, unexpected bug)
+            # must never abort the rest of the batch.
+            logging.error(f"{url} - Unhandled error during scan: {e}")
+            print(f"{url} - [ERROR] {e}")
+        # Small breathing room between targets to be gentle on flaky links.
+        time.sleep(0.2)
+
 
 def main():
     # Display the banner
     print("""
 
     Author: Bryan Smith (@securekomodo)
+    Improved by: Dylvie Shwartz (@dylvie)
     ------------------------
     _________ .__  __         .__                              
-    \_   ___ \|__|/  |________|__|__  ___                      
-    /    \  \/|  \   __\_  __ \  \  \/  /                      
-    \     \___|  ||  |  |  | \/  |>    <                       
-     \______  /__||__|  |__|  |__/__/\_ \                      
-        \/                         \/                      
+    \\_   ___ \\|__|/  |________|__|__  ___                      
+    /    \\  \\/|  \\   __\\_  __ \\  \\  \\/  /                      
+    \\     \\___|  ||  |  |  | \\/  |>    <                       
+     \\______  /__||__|  |__|  |__/__/\\_ \\                      
+        \\/                         \\/                      
     .___                                     __                
     |   | ____   ____________   ____   _____/  |_  ___________ 
-    |   |/    \ /  ___/\____ \_/ __ \_/ ___\   __\/  _ \_  __ \\
-    |   |   |  \\___ \ |  |_> >  ___/\  \___|  | (  <_> )  | \/
-    |___|___|  /____  >|   __/ \___  >\___  >__|  \____/|__|   
-             \/     \/ |__|        \/     \/                                
+    |   |/    \\ /  ___/\\____ \\_/ __ \\_/ ___\\   __\\/  _ \\_  __ \\\\
+    |   |   |  \\\\___ \\ |  |_> >  ___/\\  \\___|  | (  <_> )  | \\/
+    |___|___|  /____  >|   __/ \\___  >\\___  >__|  \\____/|__|   
+             \\/     \\/ |__|        \\/     \\/                                
 
        citrixInspector
        ------------------------
@@ -953,10 +1086,14 @@ def main():
         logging.info(f"Scan started: {timestamp}")
         print(f"Scan started: {timestamp}")
         print(f"{args.url} - Checking for known Citrix ADC / NetScaler Gateway CVEs")
-        if args.ioc_check:
-            print(f"{args.url} - Checking if compromised by CVE-2023-3519 (Be patient!)")
-            is_site_compromised(args.url)
-        is_site_vulnerable(args.url)
+        try:
+            if args.ioc_check:
+                print(f"{args.url} - Checking if compromised by CVE-2023-3519 (Be patient!)")
+                is_site_compromised(args.url)
+            is_site_vulnerable(args.url)
+        except Exception as e:
+            logging.error(f"{args.url} - Unhandled error during scan: {e}")
+            print(f"{args.url} - [ERROR] {e}")
         timestamp = datetime.datetime.now()
         logging.info(f"Scan Complete: {timestamp}")
         print(f"Scan Complete: {timestamp}")
@@ -964,14 +1101,20 @@ def main():
         timestamp = datetime.datetime.now()
         logging.info(f"Scan started: {timestamp}")
         print(f"Scan started: {timestamp}")
-        with open(args.file, 'r') as file:
-            if args.ioc_check:
-                process_urls(file.readlines(), True)
-            else:
-                process_urls(file.readlines(), False)
+        try:
+            with open(args.file, 'r') as file:
+                urls = file.readlines()
+        except OSError as e:
+            print(f"Could not read URL file {args.file}: {e}")
+            sys.exit(1)
+        if args.ioc_check:
+            process_urls(urls, True)
+        else:
+            process_urls(urls, False)
         timestamp = datetime.datetime.now()
         logging.info(f"Scan Complete: {timestamp}")
         print(f"Scan Complete: {timestamp}")
+
 
 if __name__ == "__main__":
     main()
